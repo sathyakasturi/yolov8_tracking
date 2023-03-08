@@ -41,6 +41,9 @@ from yolov8.ultralytics.yolo.utils.plotting import Annotator, colors, save_one_b
 
 from trackers.multi_tracker_zoo import create_tracker
 
+# Imports for writing to database
+from sqlalchemy.orm import Session
+import models
 
 @torch.no_grad()
 def run(
@@ -56,6 +59,9 @@ def run(
         device='',  # cuda device, i.e. 0 or 0,1,2,3 or cpu
         show_vid=False,  # show results
         save_txt=False,  # save results to *.txt
+        save_db=False,  # save results to a database
+        db_session = None, # database session recieved as context manager
+        video_id: str = None, # video model in order to associate each detection with video id
         save_conf=False,  # save confidences in --save-txt labels
         save_crop=False,  # save cropped prediction boxes
         save_trajectories=False,  # save trajectories for each track
@@ -144,7 +150,17 @@ def run(
     #model.warmup(imgsz=(1 if pt else bs, 3, *imgsz))  # warmup
     seen, windows, dt = 0, [], (Profile(), Profile(), Profile(), Profile())
     curr_frames, prev_frames = [None] * bs, [None] * bs
+    detection_models = []
+    COMMIT_DETECTIONS_SIZE = 1000
     for frame_idx, batch in enumerate(dataset):
+        # Insert the detections when number of models is greater than COMMIT_DETECTIONS_SIZE frame
+        if len(detection_models) > COMMIT_DETECTIONS_SIZE:
+            if save_db:
+                with db_session() as db:
+                    db.add_all(detection_models)
+                    db.commit()
+                    detection_models.clear()
+
         path, im, im0s, vid_cap, s = batch
         visualize = increment_path(save_dir / Path(path[0]).stem, mkdir=True) if visualize else False
         with dt[0]:
@@ -232,7 +248,7 @@ def run(
                             im_gpu=torch.as_tensor(im0, dtype=torch.float16).to(device).permute(2, 0, 1).flip(0).contiguous() /
                             255 if retina_masks else im[i]
                         )
-                    
+
                     for j, (output) in enumerate(outputs[i]):
                         
                         bbox = output[0:4]
@@ -240,16 +256,34 @@ def run(
                         cls = output[5]
                         conf = output[6]
 
-                        if save_txt:
+                        if save_txt or save_db:
                             # to MOT format
                             bbox_left = output[0]
                             bbox_top = output[1]
                             bbox_w = output[2] - output[0]
                             bbox_h = output[3] - output[1]
+
                             # Write MOT compliant results to file
-                            with open(txt_path + '.txt', 'a') as f:
-                                f.write(('%g ' * 10 + '\n') % (frame_idx + 1, id, bbox_left,  # MOT format
-                                                               bbox_top, bbox_w, bbox_h, -1, -1, -1, i))
+                            if save_txt:
+                                with open(txt_path + '.txt', 'a') as f:
+                                    f.write(('%g ' * 10 + '\n') % (frame_idx + 1, id, bbox_left,  # MOT format
+                                                                bbox_top, bbox_w, bbox_h, -1, -1, -1, i))
+
+
+                            if save_db:
+                                detection_model = models.Detection(
+                                    bbox_left=bbox_left,
+                                    bbox_top=bbox_top,
+                                    bbox_w=bbox_w,
+                                    bbox_h=bbox_h,
+                                    confidence=conf.item(),
+                                    classification=cls.item(),
+                                    detection_id=j,
+                                    track_id=id,
+                                    frame_id=frame_idx+1,
+                                    video_id=video_id,
+                                )
+                                detection_models.append(detection_model)
 
                         if save_vid or save_crop or show_vid:  # Add bbox/seg to image
                             c = int(cls)  # integer class
@@ -265,7 +299,7 @@ def run(
                             if save_crop:
                                 txt_file_name = txt_file_name if (isinstance(path, list) and len(path) > 1) else ''
                                 save_one_box(np.array(bbox, dtype=np.int16), imc, file=save_dir / 'crops' / txt_file_name / names[c] / f'{id}' / f'{p.stem}.jpg', BGR=True)
-                            
+
             else:
                 pass
                 #tracker_list[i].tracker.pred_n_update_all_tracks()
@@ -301,6 +335,13 @@ def run(
             
         # Print total time (preprocessing + inference + NMS + tracking)
         LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{sum([dt.dt for dt in dt if hasattr(dt, 'dt')]) * 1E3:.1f}ms")
+
+    # Insert the remaining detections which have not been commited previously
+    if save_db and detection_models:
+        with db_session() as db:
+            db.add_all(detection_models)
+            db.commit()
+            detection_models.clear()
 
     # Print results
     t = tuple(x.t / seen * 1E3 for x in dt)  # speeds per image
